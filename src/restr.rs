@@ -1,7 +1,7 @@
 use anyhow::Result;
 use std::collections::HashMap;
-use std::fs::File;
 use std::io::{BufRead, BufReader};
+use std::fs::File;
 
 /// Фермент с сайтом узнавания в виде регулярки (упрощённо)
 #[derive(Debug, Clone)]
