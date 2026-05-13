@@ -3,491 +3,252 @@ use fxhash::FxHashMap;
 use needletail::{parse_fastx_file, Sequence};
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
-use std::io::Write;
+use std::io::{Write, stdout};
 use std::path::Path;
 use std::time::Instant;
 
 mod restr;
 
-const K: usize = 15;
+const K: usize = 12;
 const MIN_REPEAT: usize = 50;
 const MAX_REPEAT: usize = 1500;
 const MIN_DISTANCE: usize = 5000;
-const FLANK: usize = 3500;
+const FLANK: usize = 20000;
+
+fn progress(step: usize, total: usize, label: &str) {
+    let w = 40;
+    let pct = step * 100 / total.max(1);
+    let filled = step * w / total.max(1);
+    let bar: String = (0..w).map(|i| if i < filled { '█' } else { '░' }).collect();
+    print!("\r\x1b[K  {} [{bar}] {:>3}% ({}/{})", label, pct, step, total);
+    stdout().flush().ok();
+}
 
 fn main() -> Result<()> {
     let start = Instant::now();
 
     let fasta_path = find_fasta("data")?;
-    println!("Референс: {}", fasta_path.display());
-
     let mut reader = parse_fastx_file(&fasta_path)?;
-    let record = reader
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("FASTA файл пуст"))??;
+    let record = reader.next().ok_or_else(|| anyhow::anyhow!("Empty FASTA"))??;
     let seq = record.sequence();
-    let seq_len = seq.len();
-    println!("Длина генома: {} п.н.", seq_len);
+    let seq_upper: Vec<u8> = seq
+        .iter()
+        .map(|b| b.to_ascii_uppercase())
+        .filter(|b| matches!(b, b'A' | b'C' | b'G' | b'T'))
+        .collect();
+    let seq_len = seq_upper.len();
 
-    // --- Этап 1: поиск повторов ---
-    println!("Строим хеш-таблицу k-меров (k={})...", K);
+    // --- Stage 1: k-mer index ---
+    eprint!("[1/5] Building k-mer index... ");
     let mut kmer_map: FxHashMap<u64, Vec<usize>> = FxHashMap::default();
-
     for i in 0..seq_len.saturating_sub(K) {
-        let kmer = &seq[i..i + K];
-        let hash = hash_kmer(kmer);
-        kmer_map.entry(hash).or_default().push(i);
+        kmer_map.entry(hash_kmer(&seq_upper[i..i + K])).or_default().push(i);
     }
-    println!(
-        "Уникальных k-меров: {} (из {} всего)",
-        kmer_map.len(),
-        seq_len - K + 1
-    );
+    eprintln!("done");
 
-    println!("Ищем повторы...");
-    let mut repeats: Vec<Repeat> = Vec::new();
-
-    for (_hash, positions) in &kmer_map {
-        if positions.len() < 2 {
-            continue;
+    // --- Stage 2: repeat detection ---
+    eprintln!("[2/5] Detecting repeats...");
+    let mut repeats: Vec<(usize, usize, usize, usize)> = Vec::new();
+    let total_hashes = kmer_map.len();
+    let mut processed = 0;
+    for positions in kmer_map.values() {
+        processed += 1;
+        if processed % 50000 == 0 {
+            progress(processed, total_hashes, "  k-mer groups");
         }
-        for i in 0..positions.len() {
-            for j in (i + 1)..positions.len() {
-                let pos1 = positions[i];
-                let pos2 = positions[j];
-
-                let mut left = 0;
-                while left < pos1.min(pos2)
-                    && seq[pos1 - left - 1].to_ascii_uppercase()
-                        == seq[pos2 - left - 1].to_ascii_uppercase()
-                {
-                    left += 1;
-                }
-
-                let mut right = K;
-                while pos1 + right < seq_len
-                    && pos2 + right < seq_len
-                    && seq[pos1 + right].to_ascii_uppercase()
-                        == seq[pos2 + right].to_ascii_uppercase()
-                {
-                    right += 1;
-                }
-
-                let total_len = left + right;
-                let start1 = pos1 - left;
-                let start2 = pos2 - left;
-
-                if total_len >= MIN_REPEAT && total_len <= MAX_REPEAT {
-                    repeats.push(Repeat {
-                        start1,
-                        end1: start1 + total_len,
-                        start2,
-                        end2: start2 + total_len,
-                        length: total_len,
-                    });
+        if positions.len() < 2 { continue; }
+        let mut by_kmer: FxHashMap<Vec<u8>, Vec<usize>> = FxHashMap::default();
+        for &pos in positions {
+            by_kmer.entry(seq_upper[pos..pos + K].to_vec()).or_default().push(pos);
+        }
+        for grouped in by_kmer.values() {
+            if grouped.len() < 2 { continue; }
+            for i in 0..grouped.len() {
+                for j in (i + 1)..grouped.len() {
+                    let p1 = grouped[i];
+                    let p2 = grouped[j];
+                    let mut left = 0usize;
+                    while left < p1.min(p2) && seq_upper[p1 - left - 1] == seq_upper[p2 - left - 1] { left += 1; }
+                    let mut right = K;
+                    while p1 + right < seq_len && p2 + right < seq_len && seq_upper[p1 + right] == seq_upper[p2 + right] { right += 1; }
+                    let len = left + right;
+                    if len >= MIN_REPEAT && len <= MAX_REPEAT {
+                        let s1 = p1 - left;
+                        let s2 = p2 - left;
+                        repeats.push((s1, s1 + len, s2, s2 + len));
+                    }
                 }
             }
         }
     }
+    progress(total_hashes, total_hashes, "  k-mer groups");
+    eprintln!();
+    repeats.sort_by_key(|r| (r.0, r.2));
+    let mut seen = HashSet::new();
+    repeats.retain(|r| seen.insert((r.0, r.1, r.2, r.3)));
+    let filtered: Vec<_> = repeats.into_iter()
+        .filter(|&(s1, e1, s2, e2)| distance(s1, e1, s2, e2, seq_len) >= MIN_DISTANCE)
+        .collect();
+    eprintln!("  {} direct repeats found", filtered.len());
 
-    println!("Всего пар до фильтрации: {}", repeats.len());
-    let filtered = filter_repeats(&repeats, seq_len, MIN_DISTANCE);
-    println!("После фильтрации: {}", filtered.len());
+    // --- Export repeats ---
+    let mut rep_file = File::create("repeats.csv")?;
+    writeln!(rep_file, "id,start1,end1,start2,end2,length,distance")?;
+    for (i, &(s1, e1, s2, e2)) in filtered.iter().enumerate() {
+        writeln!(rep_file, "{},{},{},{},{},{},{}", i + 1, s1, e1, s2, e2, e1 - s1, distance(s1, e1, s2, e2, seq_len))?;
+    }
 
-    // --- Этап 2: карта рестрикции ---
-    println!("\n--- Карта рестрикции ---");
+    // --- Stage 3: restriction map ---
+    eprint!("[3/5] Building restriction map... ");
     let enzymes = restr::parse_enzymes("data/enzymes.csv")?;
-    println!("Загружено ферментов: {}", enzymes.len());
-
-    let mut restriction_map = restr::build_map(seq, &enzymes);
-    restriction_map.retain(|_, sites| sites.len() <= 500);
-
-    // Нормализуем имена
-    let mut normalized_map: HashMap<String, Vec<usize>> = HashMap::new();
-    for (name, sites) in &restriction_map {
-        let short = normalize_name(name);
-        normalized_map.entry(short).or_default().extend(sites);
+    let mut rmap = restr::build_map(seq, &enzymes);
+    rmap.retain(|_, s| s.len() <= 500);
+    let mut nmap: HashMap<String, Vec<usize>> = HashMap::new();
+    for (name, sites) in &rmap {
+        nmap.entry(normalize_name(name)).or_default().extend(sites);
     }
+    eprintln!("{} enzymes", nmap.len());
 
-    let mut with_sites: Vec<_> = normalized_map
-        .iter()
-        .filter(|(_, sites)| !sites.is_empty())
-        .collect();
-    with_sites.sort_by_key(|(_, sites)| -(sites.len() as i64));
-
-    println!(
-        "Ферментов (нормализовано, ≤500 сайтов): {}",
-        with_sites.len()
-    );
-    for (name, sites) in with_sites.iter().take(10) {
-        println!("  {}: {} сайтов", name, sites.len());
-    }
-
-    // --- Этап 3: диагностические фрагменты ---
-    println!("\n--- Диагностические фрагменты ---");
-    let mut all_solutions: Vec<(usize, String, String, char, usize)> = Vec::new();
-
-    for (idx, repeat) in filtered.iter().enumerate() {
-        let solutions = find_diagnostic_fragments(repeat, &normalized_map, seq_len);
-        for sol in solutions {
-            all_solutions.push((
-                idx,
-                sol.enzyme1,
-                sol.enzyme2,
-                sol.ring,
-                sol.fragment_length,
-            ));
+    // --- Stage 4: diagnostic fragments ---
+    eprintln!("[4/5] Searching diagnostic fragments...");
+    let mut all_sol: Vec<(usize, String, String, char, usize)> = Vec::new();
+    let total_repeats = filtered.len();
+    for (idx, &(s1, e1, s2, e2)) in filtered.iter().enumerate() {
+        if idx % 50 == 0 {
+            progress(idx, total_repeats, "  repeats");
+        }
+        let r = Repeat { start1: s1, end1: e1, start2: s2, end2: e2, length: e1 - s1 };
+        for sol in find_diag(&r, &nmap, seq_len) {
+            all_sol.push((idx, sol.enzyme1, sol.enzyme2, sol.ring, sol.fragment_length));
         }
     }
+    progress(total_repeats, total_repeats, "  repeats");
+    eprintln!();
+    eprintln!("  {} diagnostic variants", all_sol.len());
 
-    println!("Всего диагностических вариантов: {}", all_solutions.len());
-
-    let mut unique: HashSet<(usize, String, String, char)> = HashSet::new();
-    for (idx, e1, e2, ring, _) in &all_solutions {
-        unique.insert((*idx, e1.clone(), e2.clone(), *ring));
+    // --- Stage 5: optimization ---
+    eprint!("[5/5] Optimization... ");
+    let mut cov: HashMap<(String, String), HashSet<usize>> = HashMap::new();
+    for (idx, e1, e2, _, _) in &all_sol {
+        let key = if e1 <= e2 { (e1.clone(), e2.clone()) } else { (e2.clone(), e1.clone()) };
+        cov.entry(key).or_default().insert(*idx);
     }
-    println!(
-        "Уникальных комбинаций (повтор + пара ферментов): {}",
-        unique.len()
-    );
+    let mut ranked: Vec<_> = cov.iter().map(|((e1, e2), r)| (e1.clone(), e2.clone(), r.len())).collect();
+    ranked.sort_by_key(|(_, _, c)| -(*c as i64));
+    let selected = greedy_select(&cov, filtered.len());
+    let mut cum: HashSet<usize> = HashSet::new();
+    eprintln!("done\n");
 
-    // Группировка по парам ферментов
-    let mut enzyme_pair_coverage: HashMap<(String, String), HashSet<usize>> = HashMap::new();
-    for (idx, e1, e2, _ring, _) in &all_solutions {
-        let key = if e1 <= e2 {
-            (e1.clone(), e2.clone())
-        } else {
-            (e2.clone(), e1.clone())
-        };
-        enzyme_pair_coverage.entry(key).or_default().insert(*idx);
+    // --- Output ---
+    println!("Top-10 enzyme pairs:");
+    for (e1, e2, c) in ranked.iter().take(10) {
+        println!("  {} + {} : {} repeats", e1, e2, c);
     }
-
-    // Сортируем по покрытию
-    let mut ranked: Vec<_> = enzyme_pair_coverage
-        .iter()
-        .map(|((e1, e2), repeats)| (e1.clone(), e2.clone(), repeats.len()))
-        .collect();
-    ranked.sort_by_key(|(_, _, count)| -(*count as i64));
-
-    println!("\n=== Топ-20 пар ферментов по покрытию ===");
-    println!(
-        "{:<20} | {:<20} | {}",
-        "enzyme1", "enzyme2", "покрыто повторов"
-    );
-    println!("{:-<20}-+-{:-<20}-+-{:-<8}", "", "", "");
-    for (e1, e2, count) in ranked.iter().take(20) {
-        println!("{:<20} | {:<20} | {}", e1, e2, count);
-    }
-
-    // --- Этап 4: жадный отбор ---
-    println!("\n--- Жадный отбор оптимального набора ---");
-    let selected = greedy_select(&enzyme_pair_coverage, filtered.len());
-
-    println!("Отобрано реакций: {}", selected.len());
-    println!(
-        "{:<3} | {:<20} | {:<20} | {:<8} | {}",
-        "№", "фермент 1", "фермент 2", "покрыто", "накопл."
-    );
-    println!("{:-<3}-+-{:-<20}-+-{:-<20}-+-{:-<8}-+-{:-<8}", "", "", "", "", "");
-    let mut cumulative: HashSet<usize> = HashSet::new();
+    println!("Optimal set:");
     for (i, (e1, e2)) in selected.iter().enumerate() {
-        if let Some(repeats) = enzyme_pair_coverage.get(&(e1.clone(), e2.clone())) {
-            cumulative.extend(repeats);
-            println!(
-                "{:<3} | {:<20} | {:<20} | {:<8} | {}/{}",
-                i + 1,
-                e1,
-                e2,
-                repeats.len(),
-                cumulative.len(),
-                filtered.len()
-            );
+        if let Some(r) = cov.get(&(e1.clone(), e2.clone())) {
+            cum.extend(r);
+            println!("  {}. {} + {} : {} covered (cumulative {}/{})", i + 1, e1, e2, r.len(), cum.len(), filtered.len());
         }
     }
 
-    // --- Экспорт в CSV ---
-    println!("\n--- Экспорт ---");
-    export_results(
-        "diagnostic_results.csv",
-        &all_solutions,
-        &enzyme_pair_coverage,
-        &selected,
-        filtered.len(),
-    )?;
-    println!("Результаты сохранены в diagnostic_results.csv");
-
-    println!("\nОбщее время: {:.2} сек", start.elapsed().as_secs_f64());
+    // --- Export diagnostics ---
+    let mut f = File::create("diagnostic_results.csv")?;
+    writeln!(f, "repeat_idx,enzyme1,enzyme2,ring,fragment_length,in_optimal_set")?;
+    let opt: HashSet<(String, String)> = selected.iter().cloned().collect();
+    for (idx, e1, e2, ring, len) in all_sol.iter().take(10000) {
+        let key = if e1 <= e2 { (e1.clone(), e2.clone()) } else { (e2.clone(), e1.clone()) };
+        writeln!(f, "{},{},{},{},{},{}", idx, e1, e2, ring, len, opt.contains(&key))?;
+    }
+    eprintln!("Done in {:.2} s", start.elapsed().as_secs_f64());
     Ok(())
 }
 
-// ---- Структуры ----
+// ===== Data structures =====
+struct Repeat { start1: usize, end1: usize, start2: usize, end2: usize, length: usize }
+struct DiagSol { enzyme1: String, enzyme2: String, ring: char, fragment_length: usize }
 
-#[derive(Debug, Clone)]
-struct Repeat {
-    start1: usize,
-    end1: usize,
-    start2: usize,
-    end2: usize,
-    length: usize,
-}
-
-#[derive(Debug, Clone)]
-struct DiagnosticSolution {
-    start1: usize,
-    end1: usize,
-    start2: usize,
-    end2: usize,
-    ring: char,
-    enzyme1: String,
-    enzyme2: String,
-    fragment_length: usize,
-}
-
-// ---- Вспомогательные функции ----
-
-fn find_fasta(dir: &str) -> Result<std::path::PathBuf> {
-    let dir = Path::new(dir);
-    if !dir.exists() {
-        anyhow::bail!("Папка '{}' не найдена.", dir.display());
-    }
-    for entry in std::fs::read_dir(dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if let Some(ext) = path.extension() {
-            if ext == "fasta" || ext == "fa" || ext == "fna" {
-                return Ok(path);
-            }
-        }
-    }
-    anyhow::bail!("В папке '{}' не найдено .fasta или .fa файлов.", dir.display())
-}
-
-fn hash_kmer(kmer: &[u8]) -> u64 {
-    let mut h: u64 = 0;
-    for &b in kmer.iter().take(16) {
-        h = h.wrapping_mul(5).wrapping_add(match b.to_ascii_uppercase() {
-            b'A' => 0,
-            b'C' => 1,
-            b'G' => 2,
-            b'T' => 3,
-            _ => 4,
-        });
-    }
-    h
-}
-
-fn filter_repeats(repeats: &[Repeat], genome_len: usize, min_dist: usize) -> Vec<Repeat> {
-    let mut sorted = repeats.to_vec();
-    sorted.sort_by_key(|r| -(r.length as i64));
-
-    let mut kept: Vec<Repeat> = Vec::new();
-    for r in &sorted {
-        let distance = distance_between(r, genome_len);
-        if distance < min_dist {
-            continue;
-        }
-        let overlaps = kept.iter().any(|existing| {
-            overlaps_any(existing.start1, existing.end1, r.start1, r.end1)
-                || overlaps_any(existing.start2, existing.end2, r.start2, r.end2)
-        });
-        if !overlaps {
-            kept.push(r.clone());
-        }
-    }
-    kept.sort_by_key(|r| r.start1);
-    kept
-}
-
-fn distance_between(r: &Repeat, genome_len: usize) -> usize {
-    let d1 = if r.start2 >= r.end1 {
-        r.start2 - r.end1
-    } else {
-        genome_len - r.end1 + r.start2
-    };
-    let d2 = if r.start1 >= r.end2 {
-        r.start1 - r.end2
-    } else {
-        genome_len - r.end2 + r.start1
-    };
+// ===== Distance (circular) =====
+fn distance(s1: usize, e1: usize, s2: usize, e2: usize, g: usize) -> usize {
+    let d1 = if s2 >= e1 { s2 - e1 } else { g - e1 + s2 };
+    let d2 = if s1 >= e2 { s1 - e2 } else { g - e2 + s1 };
     d1.min(d2)
 }
 
-fn overlaps_any(start1: usize, end1: usize, start2: usize, end2: usize) -> bool {
-    start1 < end2 && start2 < end1
+// ===== K-mer hash =====
+fn hash_kmer(kmer: &[u8]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for &b in kmer.iter() { b.to_ascii_uppercase().hash(&mut hasher); }
+    hasher.finish()
 }
 
-fn find_diagnostic_fragments(
-    repeat: &Repeat,
-    rmap: &HashMap<String, Vec<usize>>,
-    genome_len: usize,
-) -> Vec<DiagnosticSolution> {
-    let mut solutions = Vec::new();
-    let flank = FLANK;
-
-    let region_a1_start = repeat.start1.saturating_sub(flank);
-    let region_a1_end = (repeat.start1 + flank).min(genome_len);
-    let region_a2_start = repeat.end1.saturating_sub(flank);
-    let region_a2_end = (repeat.end1 + flank).min(genome_len);
-    let region_b1_start = repeat.start2.saturating_sub(flank);
-    let region_b1_end = (repeat.start2 + flank).min(genome_len);
-    let region_b2_start = repeat.end2.saturating_sub(flank);
-    let region_b2_end = (repeat.end2 + flank).min(genome_len);
-
-    for (enzyme1, sites1) in rmap {
-        let sites_near_a1: Vec<usize> = sites1
-            .iter()
-            .filter(|&&p| p >= region_a1_start && p <= region_a1_end)
-            .copied()
-            .collect();
-        let sites_near_a2: Vec<usize> = sites1
-            .iter()
-            .filter(|&&p| p >= region_a2_start && p <= region_a2_end)
-            .copied()
-            .collect();
-
-        for (enzyme2, sites2) in rmap {
-            let sites_near_b1: Vec<usize> = sites2
-                .iter()
-                .filter(|&&p| p >= region_b1_start && p <= region_b1_end)
-                .copied()
-                .collect();
-            let sites_near_b2: Vec<usize> = sites2
-                .iter()
-                .filter(|&&p| p >= region_b2_start && p <= region_b2_end)
-                .copied()
-                .collect();
-
-            for &s1 in &sites_near_a1 {
-                for &s2 in &sites_near_a2 {
-                    for &s3 in &sites_near_b1 {
-                        for &s4 in &sites_near_b2 {
-                            let len_no_recomb_1 = s2.saturating_sub(s1);
-                            let len_no_recomb_2 = s4.saturating_sub(s3);
-                            let len_recomb_1 = s4.saturating_sub(s1);
-                            let len_recomb_2 = s2.saturating_sub(s3);
-
-                            if (len_no_recomb_1 != len_recomb_1
-                                || len_no_recomb_2 != len_recomb_2)
-                                && (len_recomb_1 >= 50 || len_recomb_2 >= 50)
-                            {
-                                solutions.push(DiagnosticSolution {
-                                    start1: repeat.start1,
-                                    end1: repeat.end1,
-                                    start2: repeat.start2,
-                                    end2: repeat.end2,
-                                    ring: 'A',
-                                    enzyme1: enzyme1.clone(),
-                                    enzyme2: enzyme2.clone(),
-                                    fragment_length: len_recomb_1.max(len_recomb_2),
-                                });
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-    solutions
-}
-
+// ===== Enzyme name normalization =====
 fn normalize_name(name: &str) -> String {
-    let clean = name
-        .trim()
-        .replace("WarmStart ", "")
-        .replace("WarmStart", "");
-    let clean = clean.replace(" §", "").replace("§", "");
-    let clean = clean
-        .trim_end_matches("-HFv2")
-        .trim_end_matches("-HF")
-        .trim_end_matches("-v2");
-    clean.trim().to_string()
+    name.replace("WarmStart ", "").replace(" §", "").replace("§", "")
+        .trim_end_matches("-HFv2").trim_end_matches("-HF").trim_end_matches("-v2")
+        .trim().to_string()
 }
 
-fn greedy_select(
-    coverage: &HashMap<(String, String), HashSet<usize>>,
-    total_repeats: usize,
-) -> Vec<(String, String)> {
-    let mut selected: Vec<(String, String)> = Vec::new();
+// ===== Greedy set cover =====
+fn greedy_select(cov: &HashMap<(String, String), HashSet<usize>>, total: usize) -> Vec<(String, String)> {
+    let mut sel = Vec::new();
     let mut covered: HashSet<usize> = HashSet::new();
-
-    let mut pairs: Vec<(&(String, String), &HashSet<usize>)> = coverage.iter().collect();
-    pairs.sort_by_key(|(_, repeats)| -(repeats.len() as i64));
-
+    let mut pairs: Vec<_> = cov.iter().collect();
+    pairs.sort_by_key(|(_, r)| -(r.len() as i64));
     for _ in 0..pairs.len() {
-        if covered.len() >= total_repeats {
-            break;
-        }
+        if covered.len() >= total { break; }
         let mut best: Option<((String, String), usize)> = None;
-        for ((e1, e2), repeats) in &pairs {
-            let new_coverage = repeats.difference(&covered).count();
-            if new_coverage > 0 {
-                match best {
-                    Some((_, best_count)) if new_coverage > best_count => {
-                        best = Some(((e1.clone(), e2.clone()), new_coverage));
-                    }
-                    None => {
-                        best = Some(((e1.clone(), e2.clone()), new_coverage));
-                    }
-                    _ => {}
-                }
+        for ((e1, e2), reps) in &pairs {
+            let new = reps.difference(&covered).count();
+            if new > 0 && best.as_ref().map_or(true, |(_, c)| new > *c) {
+                best = Some(((e1.clone(), e2.clone()), new));
             }
         }
         if let Some(((e1, e2), _)) = best {
-            selected.push((e1.clone(), e2.clone()));
-            if let Some(repeats) = coverage.get(&(e1.clone(), e2.clone())) {
-                covered.extend(repeats);
-            }
-        } else {
-            break;
-        }
+            sel.push((e1.clone(), e2.clone()));
+            if let Some(r) = cov.get(&(e1.clone(), e2.clone())) { covered.extend(r); }
+        } else { break; }
     }
-    selected
+    sel
 }
 
-fn export_results(
-    path: &str,
-    all: &[(usize, String, String, char, usize)],
-    coverage: &HashMap<(String, String), HashSet<usize>>,
-    selected: &[(String, String)],
-    total_repeats: usize,
-) -> Result<()> {
-    let mut file = File::create(path)?;
-    writeln!(
-        file,
-        "repeat_idx,enzyme1,enzyme2,ring,fragment_length,in_optimal_set"
-    )?;
-
-    let optimal_set: HashSet<(String, String)> = selected.iter().cloned().collect();
-
-    for (idx, e1, e2, ring, frag_len) in all {
-        let key = if e1 <= e2 {
-            (e1.clone(), e2.clone())
-        } else {
-            (e2.clone(), e1.clone())
-        };
-        let in_opt = optimal_set.contains(&key);
-        writeln!(
-            file,
-            "{},{},{},{},{},{}",
-            idx, e1, e2, ring, frag_len, in_opt
-        )?;
-    }
-
-    writeln!(file, "\n--- Optimal set summary ---")?;
-    writeln!(file, "enzyme1,enzyme2,repeats_covered")?;
-    let mut cumulative: HashSet<usize> = HashSet::new();
-    for (e1, e2) in selected {
-        if let Some(repeats) = coverage.get(&(e1.clone(), e2.clone())) {
-            cumulative.extend(repeats);
-            writeln!(file, "{},{},{}", e1, e2, repeats.len())?;
+// ===== Diagnostic fragment search =====
+fn find_diag(r: &Repeat, rmap: &HashMap<String, Vec<usize>>, g: usize) -> Vec<DiagSol> {
+    let mut sol = Vec::new();
+    let f = FLANK;
+    let r1 = r.start1.saturating_sub(f)..=(r.start1 + f).min(g);
+    let r2 = r.end1.saturating_sub(f)..=(r.end1 + f).min(g);
+    let r3 = r.start2.saturating_sub(f)..=(r.start2 + f).min(g);
+    let r4 = r.end2.saturating_sub(f)..=(r.end2 + f).min(g);
+    for (e1, s1) in rmap {
+        let a1: Vec<usize> = s1.iter().filter(|&&p| r1.contains(&p)).copied().collect();
+        let a2: Vec<usize> = s1.iter().filter(|&&p| r2.contains(&p)).copied().collect();
+        for (e2, s2) in rmap {
+            let b1: Vec<usize> = s2.iter().filter(|&&p| r3.contains(&p)).copied().collect();
+            let b2: Vec<usize> = s2.iter().filter(|&&p| r4.contains(&p)).copied().collect();
+            for &p1 in &a1 { for &p2 in &a2 { for &p3 in &b1 { for &p4 in &b2 {
+                let nr1 = p2.saturating_sub(p1);
+                let nr2 = p4.saturating_sub(p3);
+                let rr1 = p4.saturating_sub(p1);
+                let rr2 = p2.saturating_sub(p3);
+                if (nr1 != rr1 || nr2 != rr2) && ((rr1 >= 500 && rr1 <= 10000) || (rr2 >= 500 && rr2 <= 10000)) {
+                    sol.push(DiagSol { enzyme1: e1.clone(), enzyme2: e2.clone(), ring: 'A', fragment_length: rr1.max(rr2) });
+                }
+            }}}}
         }
     }
-    writeln!(
-        file,
-        "\nTotal repeats covered: {}/{}",
-        cumulative.len(),
-        total_repeats
-    )?;
+    sol
+}
 
-    Ok(())
+fn find_fasta(dir: &str) -> Result<std::path::PathBuf> {
+    let dir = Path::new(dir);
+    if !dir.exists() { anyhow::bail!("Directory '{}' not found", dir.display()); }
+    for entry in std::fs::read_dir(dir)? {
+        let path = entry?.path();
+        if let Some(ext) = path.extension() {
+            if ext == "fasta" || ext == "fa" || ext == "fna" { return Ok(path); }
+        }
+    }
+    anyhow::bail!("No .fasta file found in '{}'", dir.display())
 }
