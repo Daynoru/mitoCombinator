@@ -13,7 +13,7 @@ const K: usize = 12;
 const MIN_REPEAT: usize = 50;
 const MAX_REPEAT: usize = 1500;
 const MIN_DISTANCE: usize = 5000;
-const FLANK: usize = 20000;
+const FLANK: usize = 10000;
 
 fn progress(step: usize, total: usize, label: &str) {
     let w = 40;
@@ -221,12 +221,24 @@ fn find_diag(r: &Repeat, rmap: &HashMap<String, Vec<usize>>, g: usize) -> Vec<Di
     let r2 = r.end1.saturating_sub(f)..=(r.end1 + f).min(g);
     let r3 = r.start2.saturating_sub(f)..=(r.start2 + f).min(g);
     let r4 = r.end2.saturating_sub(f)..=(r.end2 + f).min(g);
-    for (e1, s1) in rmap {
+
+    let enzymes: Vec<_> = rmap.keys().cloned().collect();
+    let n = enzymes.len();
+
+    for i in 0..n {
+        let e1 = &enzymes[i];
+        let s1 = &rmap[e1];
         let a1: Vec<usize> = s1.iter().filter(|&&p| r1.contains(&p)).copied().collect();
         let a2: Vec<usize> = s1.iter().filter(|&&p| r2.contains(&p)).copied().collect();
-        for (e2, s2) in rmap {
+        if a1.is_empty() || a2.is_empty() { continue; }
+
+        for j in i..=i {  // только одиночный фермент
+            let e2 = &enzymes[j];
+            let s2 = &rmap[e2];
             let b1: Vec<usize> = s2.iter().filter(|&&p| r3.contains(&p)).copied().collect();
             let b2: Vec<usize> = s2.iter().filter(|&&p| r4.contains(&p)).copied().collect();
+            if b1.is_empty() || b2.is_empty() { continue; }
+
             for &p1 in &a1 { for &p2 in &a2 { for &p3 in &b1 { for &p4 in &b2 {
                 let nr1 = p2.saturating_sub(p1);
                 let nr2 = p4.saturating_sub(p3);
